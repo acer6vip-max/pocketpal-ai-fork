@@ -204,7 +204,22 @@ describe('策展默认 n_ctx 门禁（2026-08-21 真实 GGUF 验算；v2 2026-08
     }
   });
 
-  it('版本号已随 v2 表升档（CURATED_TABLE_VERSION=2，驱动拉齐）', () => {
-    expect(CURATED_TABLE_VERSION).toBe(2);
+  it('v3 大模型档位锚定（2026-11-05 加载失败根治：>4GB 默认 4096）', () => {
+    const qwen9b = {
+      name: 'Qwen3.5-9B',
+      filename: 'Qwen3.5-9B-Q4_K_M.gguf',
+      size: 5.5e9,
+    } as unknown as Model;
+    expect(defaultNCtxForModel(qwen9b)).toBe(4096);
+    const genericLarge = {
+      name: 'Llama-3.1-8B',
+      filename: 'Llama-3.1-8B-Instruct-Q4_K_M.gguf',
+      size: 4.9e9,
+    } as unknown as Model;
+    expect(defaultNCtxForModel(genericLarge)).toBe(4096);
+  });
+
+  it('版本号已随 v3 表升档（CURATED_TABLE_VERSION=3，驱动拉齐）', () => {
+    expect(CURATED_TABLE_VERSION).toBe(3);
   });
 });

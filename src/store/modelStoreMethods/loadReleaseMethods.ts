@@ -12,8 +12,9 @@
  */
 import {AppState, AppStateStatus, Platform, Alert} from 'react-native';
 import {runInAction, toJS} from 'mobx';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as RNFS from '@dr.pogodin/react-native-fs';
-import {LlamaContext, initLlama} from 'llama.rn';
+import {ContextParams, LlamaContext, initLlama} from 'llama.rn';
 
 import type {modelStore as modelStoreInstance} from '../ModelStore';
 import {serverStore} from '../ServerStore';
@@ -30,13 +31,17 @@ import {
   LocalCompletionEngine,
   OpenAICompletionEngine,
 } from '../../api/completionEngines';
-import {Model, ModelOrigin} from '../../utils/types';
+import {Model, ModelOrigin, ContextInitParams} from '../../utils/types';
 import {resolveModelCaps} from '../../utils/modelCaps';
 import type {ModelCapabilityView} from '../../utils/modelCaps';
 import {capsMatchBinding} from '../../utils/remoteCaps';
 import {hasEnoughMemory} from '../../hooks/useMemoryCheck';
 import {isHighEndDevice} from '../../utils/deviceCapabilities';
-import {getModelMemoryRequirement} from '../../utils/memoryEstimator';
+import {
+  getModelMemoryRequirement,
+  resolveLoadBudget,
+} from '../../utils/memoryEstimator';
+import {CONTEXT_LADDER} from '../../utils/bannerVariantResolver';
 import {
   detectThinkingCapability,
   detectReasoningReinject,
@@ -52,6 +57,97 @@ import {chatSessionRepository} from '../../repositories/ChatSessionRepository';
 
 /** ModelStore 实例类型（类未导出，从单例推导；type-only import 无运行时环） */
 type ModelStore = typeof modelStoreInstance;
+
+/**
+ * 加载尝试标记（2026-11-05）：initLlama 前写入，成功后删除。
+ * 进程被厂商 PSS 看护直接杀掉时 JS 无法 catch，标记会留在 AsyncStorage，
+ * 下次冷启动据此把同一模型降一档，避免「启动即被杀」的死循环。
+ */
+const LOAD_ATTEMPT_KEY = 'modelLoadAttempt:v1';
+/** 大模型门槛：≥4GB 权重在低内存机型上需要加载前先归还 native 缓存页。 */
+const LARGE_MODEL_BYTES = 4e9;
+
+/** 取上下文档位的下一档（如 4096 → 2048）；已是最小档返回 undefined。 */
+function nextLowerContextTier(nCtx: number): number | undefined {
+  let lower: number | undefined;
+  for (const tier of CONTEXT_LADDER) {
+    if (tier >= nCtx) {
+      break;
+    }
+    lower = tier;
+  }
+  return lower;
+}
+
+/** 降档后同步收紧 n_batch/n_ubatch，避免 batch 大于 n_ctx。 */
+function clampBatchToContext(
+  settings: Omit<ContextParams, 'model'>,
+  nCtx: number,
+): Omit<ContextParams, 'model'> {
+  const batch = Math.min(settings.n_batch ?? 512, nCtx);
+  return {
+    ...settings,
+    n_ctx: nCtx,
+    n_batch: batch,
+    n_ubatch: Math.min(settings.n_ubatch ?? 512, batch),
+  };
+}
+
+/**
+ * 按实时可用内存挑选最大可装档位：预算 = resolveLoadBudget（6GB PSS 硬杀线上限）。
+ * 若连最小档位都装不下（大模型权重本身已超预算），仍返回最小档尽力加载，
+ * 而不是干脆拒绝——原版 App 9B 正是以最小档位稳定运行。
+ */
+function pickSafeContextTier(
+  model: Model,
+  projectionModel: Model | undefined,
+  baseSettings: ContextInitParams,
+  requested: number,
+  availableBytes: number | undefined,
+): number {
+  const budget = resolveLoadBudget(availableBytes);
+  const tiers = CONTEXT_LADDER.filter(tier => tier <= requested).reverse();
+  for (const tier of tiers) {
+    try {
+      const estimate = getModelMemoryRequirement(model, projectionModel, {
+        ...baseSettings,
+        n_ctx: tier,
+      });
+      if (estimate <= budget) {
+        return tier;
+      }
+    } catch {
+      // 元数据不可用时无法验算，跳过该档继续往下找
+    }
+  }
+  return CONTEXT_LADDER[0];
+}
+
+/** 读取上次未完成的加载尝试（同模型才生效）。 */
+async function readCrashedLoadAttempt(
+  modelId: string,
+): Promise<{nCtx: number; nGpuLayers: number} | undefined> {
+  try {
+    const raw = await AsyncStorage.getItem(LOAD_ATTEMPT_KEY);
+    if (!raw) {
+      return undefined;
+    }
+    const parsed = JSON.parse(raw) as {
+      modelId?: string;
+      n_ctx?: number;
+      n_gpu_layers?: number;
+    };
+    if (parsed.modelId === modelId && typeof parsed.n_ctx === 'number') {
+      return {
+        nCtx: parsed.n_ctx,
+        nGpuLayers: parsed.n_gpu_layers ?? 0,
+      };
+    }
+  } catch {
+    // 标记损坏/存储不可用时忽略，按正常流程加载
+  }
+  return undefined;
+}
 
 export function applyLoadReleaseMethods(store: ModelStore): void {
   /**
@@ -344,39 +440,179 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
       store.activeProjectionModelId = projectionModel?.id;
     });
 
-    // §18.6 每模型预调：无覆盖时按内存 ceiling 预写最大可装档（一次预调、
-    // 持久化），赶在 getEffectiveContextInitParams 读取之前。
+    // §18.6 每模型预调：无覆盖时写入策展默认（大模型 4096），
+    // 赶在 getEffectiveContextInitParams 读取之前。
     store.presetModelNCtxIfAbsent(model, projectionModel);
+
+    // 冷启动防崩循环：上次加载同一模型时进程被厂商 PSS 看护直接杀掉，
+    // 标记不会被清理。本次先降一档，避免「启动即被杀」的死循环。
+    const crashed = await readCrashedLoadAttempt(model.id);
+    let forceCpuFallback = false;
+    if (crashed) {
+      const current = store.getModelNCtx(model.id);
+      const lower = nextLowerContextTier(crashed.nCtx);
+      if (current >= crashed.nCtx && lower !== undefined) {
+        console.warn(
+          `[ModelStore] previous load of "${model.name}" at n_ctx ${crashed.nCtx} was killed; retry at ${lower}`,
+        );
+        store.setModelNCtx(model.id, lower, 'preset');
+      } else if (crashed.nGpuLayers > 0) {
+        // 上下文已到最小档仍被杀：上次是 GPU 全量卸载，这次退 CPU
+        forceCpuFallback = true;
+        console.warn(
+          `[ModelStore] previous load of "${model.name}" at n_ctx ${crashed.nCtx} with ${crashed.nGpuLayers} GPU layers was killed; fallback to CPU`,
+        );
+      }
+    }
+
+    // 加载前按实时可用内存夹紧上下文：preset 档位自动降档；
+    // user 手调 = 可见决策 = 主权，不在这里改动。
+    let availableBytes: number | undefined;
+    try {
+      availableBytes = await NativeHardwareInfo.getAvailableMemory();
+    } catch (error) {
+      console.warn('[ModelStore] Failed to read available memory:', error);
+    }
+    if (store.perModelNCtxSource[model.id] !== 'user') {
+      const requested = store.getModelNCtx(model.id);
+      const safe = pickSafeContextTier(
+        model,
+        projectionModel,
+        store.contextInitParams,
+        requested,
+        availableBytes,
+      );
+      if (safe < requested) {
+        console.warn(
+          `[ModelStore] load budget: "${model.name}" n_ctx ${requested} → ${safe} (available ${availableBytes ?? 'n/a'})`,
+        );
+        store.setModelNCtx(model.id, safe, 'preset');
+      }
+    }
 
     // Get all effective initialization settings BEFORE try block
     // so they're available for error reporting if initialization fails
-    const effectiveSettings = await store.getEffectiveContextInitParams(
+    let effectiveSettings = await store.getEffectiveContextInitParams(
       filePath,
       model.id,
     );
 
+    // 上次在最小上下文 + GPU 仍被系统杀掉：本次加载强制 CPU
+    if (forceCpuFallback) {
+      effectiveSettings = {
+        ...effectiveSettings,
+        n_gpu_layers: 0,
+        devices: ['CPU'],
+      };
+    }
+
+    // 大模型加载前先让 native allocator 把空闲页归还系统，压低瞬时 PSS。
+    if (model.size >= LARGE_MODEL_BYTES) {
+      try {
+        const purge = await NativeHardwareInfo.purgeNativeAllocator();
+        console.log(
+          `[ModelStore] native purge before load: ${purge.purged} (${purge.rss_kb_before}→${purge.rss_kb_after} KB)`,
+        );
+      } catch (error) {
+        console.warn('[ModelStore] native allocator purge failed:', error);
+      }
+    }
+
     try {
+      // 尝试阶梯：失败先降 n_ctx，再退 CPU-only。
+      // 被系统杀掉的场景 JS 无法 catch，由上面的崩溃标记在下次冷启动降档。
+      let ctx: LlamaContext | undefined;
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 3 && !ctx; attempt++) {
+        // 标记写入失败不影响加载本身（只是失去防崩循环保护）
+        try {
+          await AsyncStorage.setItem(
+            LOAD_ATTEMPT_KEY,
+            JSON.stringify({
+              modelId: model.id,
+              n_ctx: effectiveSettings.n_ctx,
+              n_gpu_layers: effectiveSettings.n_gpu_layers ?? 0,
+              ts: Date.now(),
+            }),
+          );
+        } catch (error) {
+          console.warn(
+            '[ModelStore] failed to write load attempt marker',
+            error,
+          );
+        }
+
+        try {
+          const t0 = Date.now();
+          ctx = await initLlama(
+            {
+              model: filePath,
+              ...effectiveSettings, // Use effectiveSettings without version for llama.rn
+              use_progress_callback: true,
+            },
+            (_progress: number) => {
+              //console.log('progress: ', _progress);
+            },
+          );
+          console.log('init time: ', Date.now() - t0);
+          try {
+            await AsyncStorage.removeItem(LOAD_ATTEMPT_KEY);
+          } catch (error) {
+            console.warn(
+              '[ModelStore] failed to clear load attempt marker',
+              error,
+            );
+          }
+        } catch (error) {
+          lastError = error;
+          console.error(
+            `[ModelStore] initLlama failed (attempt ${attempt + 1}, n_ctx ${effectiveSettings.n_ctx}, gpu ${effectiveSettings.n_gpu_layers}):`,
+            error,
+          );
+          const currentNCtx = effectiveSettings.n_ctx ?? CONTEXT_LADDER[0];
+          const lower = nextLowerContextTier(currentNCtx);
+          if (lower !== undefined) {
+            effectiveSettings = clampBatchToContext(effectiveSettings, lower);
+            continue;
+          }
+          // 已到最小上下文仍失败：退 CPU-only（GPU/OpenCL 驱动缓冲也是内存大户）
+          if ((effectiveSettings.n_gpu_layers ?? 0) > 0) {
+            effectiveSettings = {
+              ...effectiveSettings,
+              n_gpu_layers: 0,
+              devices: ['CPU'],
+            };
+            continue;
+          }
+        }
+      }
+
+      if (!ctx) {
+        throw lastError instanceof Error
+          ? lastError
+          : new Error(String(lastError ?? 'Model initialization failed'));
+      }
+
+      // 实际生效档位低于已存值（降档成功）时落盘，避免下次重复失败试探。
+      // user 手调保留主权，不覆盖设置页里的值。
+      const loadedNCtx = effectiveSettings.n_ctx;
+      if (
+        loadedNCtx &&
+        loadedNCtx !== store.getModelNCtx(model.id) &&
+        store.perModelNCtxSource[model.id] !== 'user'
+      ) {
+        store.setModelNCtx(model.id, loadedNCtx, 'preset');
+      }
+
+      const loadedCtx = ctx;
+
       // Create properly versioned ContextInitParams
       const contextInitParams = createContextInitParams(effectiveSettings);
 
-      const t0 = Date.now();
-      const ctx = await initLlama(
-        {
-          model: filePath,
-          ...effectiveSettings, // Use effectiveSettings without version for llama.rn
-          use_progress_callback: true,
-        },
-        (_progress: number) => {
-          //console.log('progress: ', _progress);
-        },
-      );
-      const t1 = Date.now();
-      console.log('init time: ', t1 - t0);
-
-      await store.updateModelStopTokens(ctx, model);
+      await store.updateModelStopTokens(loadedCtx, model);
 
       // Check and update thinking capabilities
-      await store.updateModelThinkingCapabilities(ctx, model);
+      await store.updateModelThinkingCapabilities(loadedCtx, model);
 
       // Initialize multimodal support if mmproj path was provided
       if (isMultimodalInit && mmProjPath) {
@@ -385,7 +621,7 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
 
           // Initialize multimodal with the new API format
           // Apply effective value: clamp image_max_tokens to n_ctx
-          const success = await ctx.initMultimodal({
+          const success = await loadedCtx.initMultimodal({
             path: mmProjPath,
             use_gpu: !store.contextInitParams.no_gpu_devices,
             image_max_tokens: Math.min(
@@ -399,7 +635,7 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
           } else {
             console.log('Multimodal support initialized successfully');
             // Verify that multimodal is now enabled
-            const isEnabled = await ctx.isMultimodalEnabled();
+            const isEnabled = await loadedCtx.isMultimodalEnabled();
             console.log('Multimodal enabled status:', isEnabled);
 
             // Update the multimodal active flag
@@ -417,8 +653,8 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
       }
 
       runInAction(() => {
-        store.context = ctx;
-        store.engine = new LocalCompletionEngine(ctx);
+        store.context = loadedCtx;
+        store.engine = new LocalCompletionEngine(loadedCtx);
         store.activeRemoteBinding = undefined;
         store.activeContextSettings = contextInitParams;
         store.setActiveModel(model.id);
@@ -447,7 +683,7 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
         );
       }
 
-      return ctx;
+      return loadedCtx;
     } catch (error) {
       console.error(
         `Failed to initialize model context for "${model.name}" (${model.id}):`,

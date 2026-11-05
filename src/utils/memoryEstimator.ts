@@ -116,6 +116,21 @@ export function resolvePssSafeBudget(availableBytes?: number): number {
 }
 
 /**
+ * 加载前预算（2026-11-05 大模型加载失败根治）：与启动审计的「探索上限」
+ * 分离——真正决定生死的是一次 initLlama 的瞬时 PSS，MIUI/HyperOS 实测
+ * 6GB 硬杀线。估算公式已含 10% 余量，故预算直接封顶 6GB：小于此线才允许
+ * 超出最小档位，宁少勿杀（原版 App 9B 默认 n_ctx=2048 正是这个口径）。
+ */
+const PSS_LOAD_BUDGET_CEILING = 6.0e9;
+
+export function resolveLoadBudget(availableBytes?: number): number {
+  if (!availableBytes || availableBytes <= 0) {
+    return PSS_SAFE_BUDGET;
+  }
+  return Math.min(availableBytes, PSS_LOAD_BUDGET_CEILING);
+}
+
+/**
  * Get model memory requirement estimate in bytes
  *
  * When GGUF metadata is available:

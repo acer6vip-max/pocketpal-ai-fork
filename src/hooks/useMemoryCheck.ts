@@ -65,7 +65,12 @@ export const hasEnoughMemory = async (
   const memoryRequirement = getModelMemoryRequirement(
     modelForCalc,
     projectionModel,
-    modelStore.contextInitParams,
+    // 2026-11-05：按该模型实际生效的 n_ctx 估算（此前用全局默认 8192，
+    // 9B 的 per-model 4096/2048 与全局值不一致，会低估或误判）。
+    {
+      ...modelStore.contextInitParams,
+      n_ctx: modelStore.getModelNCtx(model.id),
+    },
   );
 
   return memoryRequirement <= ceiling;
@@ -139,6 +144,13 @@ export const useMemoryCheck = (
   // This ensures the hook re-runs when user changes context size, cache types, etc.
   const contextInitParams = modelStore.contextInitParams;
 
+  // 2026-11-05：估算用该模型实际生效的 n_ctx（per-model 覆盖），
+  // 而不是全局默认值（9B 的 4096/2048 与全局 8192 不同）。
+  const perModelNCtx =
+    'id' in model && model.id
+      ? modelStore.getModelNCtx(model.id)
+      : contextInitParams.n_ctx;
+
   useEffect(() => {
     const checkMemory = async () => {
       // Reset warnings first
@@ -149,11 +161,10 @@ export const useMemoryCheck = (
 
       try {
         const {status, requiredBytes, availableBytes} =
-          await getMemoryFitDetails(
-            model as Model,
-            projectionModel,
-            contextInitParams,
-          );
+          await getMemoryFitDetails(model as Model, projectionModel, {
+            ...contextInitParams,
+            n_ctx: perModelNCtx,
+          });
 
         setFitStatus(status);
 
@@ -203,7 +214,14 @@ export const useMemoryCheck = (
     };
 
     checkMemory();
-  }, [model, projectionModel, l10n, calibrationCeiling, contextInitParams]);
+  }, [
+    model,
+    projectionModel,
+    l10n,
+    calibrationCeiling,
+    contextInitParams,
+    perModelNCtx,
+  ]);
 
   return {memoryWarning, shortMemoryWarning, multimodalWarning, fitStatus};
 };
