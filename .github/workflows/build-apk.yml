@@ -15,10 +15,6 @@ on:
       - 'yarn.lock'
       - '.github/workflows/build-apk.yml'
 
-concurrency:
-  group: build-apk-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
