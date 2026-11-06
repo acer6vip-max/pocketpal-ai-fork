@@ -8,6 +8,7 @@ import {
   estimateMessageTokens,
   estimateMessagesTokens,
   resolveWatermark,
+  trimMessagesToBudget,
 } from '../budget';
 import type {ChatMessage} from '../../../utils/types';
 
@@ -115,5 +116,42 @@ describe('countTokensExact', () => {
       tokenize: jest.fn().mockRejectedValue(new Error('boom')),
     } as any;
     expect(await countTokensExact(ctx, 'hi')).toBeNull();
+  });
+});
+
+describe('trimMessagesToBudget 发送前硬兜底', () => {
+  const system: ChatMessage = {role: 'system', content: 'S'.repeat(400)}; // 100 token + 8
+  const turn = (i: number): ChatMessage[] => [
+    {role: 'user', content: `u${i} ${'x'.repeat(400)}`}, // ~102
+    {role: 'assistant', content: `a${i} ${'y'.repeat(400)}`}, // ~102
+  ];
+
+  it('装得下时不动（dropped=0）', () => {
+    const messages = [system, ...turn(1), {role: 'user' as const, content: 'hi'}];
+    const result = trimMessagesToBudget(messages, 10000);
+    expect(result.dropped).toBe(0);
+    expect(result.messages).toHaveLength(messages.length);
+  });
+
+  it('超预算时按轮丢弃最旧历史，保留 system 与本轮提问', () => {
+    const messages = [
+      system,
+      ...turn(1),
+      ...turn(2),
+      {role: 'user' as const, content: '现在这句'},
+    ];
+    // 预算只够 system + 最后一轮 → 丢掉最旧的一轮（2 条）
+    const result = trimMessagesToBudget(messages, 400);
+    expect(result.dropped).toBe(2);
+    expect(result.messages[0]).toBe(system);
+    expect(result.messages[result.messages.length - 1].content).toBe('现在这句');
+    expect(estimateMessagesTokens(result.messages)).toBeLessThanOrEqual(400);
+  });
+
+  it('只剩本轮仍超预算（系统提示词本身过大）→ 不裁剪，dropped=0', () => {
+    const messages = [system, {role: 'user' as const, content: 'hi'}];
+    const result = trimMessagesToBudget(messages, 50);
+    expect(result.dropped).toBe(0);
+    expect(result.messages).toHaveLength(2);
   });
 });

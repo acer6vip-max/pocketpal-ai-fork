@@ -117,3 +117,40 @@ export async function countTokensExact(
     return null;
   }
 }
+
+/**
+ * 发送前硬裁剪兜底（2026-11-06 真机取证）：上轮 contextFull 且水位仍满时
+ * 治理分支会跳过压缩直接照发（死锁防御），小 n_ctx 下必然硬错
+ * 「Context is full」，且此后每条消息都失败。这里按「轮」为单位从最旧开始
+ * 丢弃（保留全部 system 与最后一条 user），既保证装得下，又不产生孤儿
+ * tool/tool_calls 破坏严格 chat 模板。系统提示词本身就超预算时 dropped=0，
+ * 交给既有 banner 引导用户增大上下文。
+ */
+export function trimMessagesToBudget<
+  T extends BudgetMessage & {role?: string},
+>(
+  messages: readonly T[],
+  budget: number,
+): {messages: T[]; dropped: number} {
+  if (budget <= 0 || estimateMessagesTokens(messages) <= budget) {
+    return {messages: [...messages], dropped: 0};
+  }
+  const system = messages.filter(m => m.role === 'system');
+  let rest = messages.filter(m => m.role !== 'system');
+  let dropped = 0;
+  while (
+    rest.length > 0 &&
+    estimateMessagesTokens([...system, ...rest]) > budget
+  ) {
+    // 丢掉最旧的一整轮：从开头删到下一个 user 之前；只剩最后一轮时
+    // 只保留最后一条（本轮提问）。
+    const nextUser = rest.findIndex((m, i) => i > 0 && m.role === 'user');
+    const cut = nextUser === -1 ? rest.length - 1 : nextUser;
+    if (cut <= 0) {
+      break;
+    }
+    dropped += cut;
+    rest = rest.slice(cut);
+  }
+  return {messages: [...system, ...rest], dropped};
+}

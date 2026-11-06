@@ -24,8 +24,11 @@ import type {Model} from './types';
  * v3 变更：>4GB 大模型默认 16384 → 4096。9B Q4 权重 ~5.5GB + 16K f16 KV
  * ~2.4GB 超过 MIUI 6GB PSS 硬杀线（进程被系统直接杀掉）；原版 App 默认
  * n_ctx=2048。4096 使 KV 降到 ~0.6GB，加载链再按实时内存夹紧。
+ * v4 变更（2026-11-06 真机取证）：v3 的加载链会把 4096 再按预算压到 2048，
+ * 而工具 schema 基线 TOOL_BASELINE_TOKENS=4500，2048 首轮即「Context is full」。
+ * 版本升 4 自愈已落盘的 2048 → 4096 策展档；加载链不再低于可用下限。
  */
-export const CURATED_TABLE_VERSION = 3;
+export const CURATED_TABLE_VERSION = 4;
 
 // 文件名/名匹配规则（先于尺寸档）。工具 schema 注入后提示词基线 ~4.5K
 // （TOOL_BASELINE_TOKENS，bannerVariantResolver 沉底常量），每档 nCtx 必须

@@ -42,6 +42,7 @@ import {
   resolveWatermark,
   GENERATION_RESERVE,
   COMPACT_TARGET_WATERMARK,
+  trimMessagesToBudget,
 } from '../services/contextCompaction/budget';
 import {decideContextAction} from '../services/contextCompaction/decision';
 import {hasModelUpgradeFitting} from '../components/IncreaseContextSheet/fitStatus';
@@ -356,6 +357,28 @@ const prepareCompletion = async ({
         }
       }
     } // else（非满态）结束
+  }
+
+  // 发送前硬兜底（2026-11-06 真机取证）：小 n_ctx（2048/4096）下，治理在
+  // 「上轮 contextFull 且水位仍满」时跳过压缩直接照发，原生层必抛
+  // "Context is full" 且此后每条都失败。这里按轮丢弃最旧历史，保证装得下；
+  // system（人格/召回/摘要）全保留，系统提示词本身超预算时 dropped=0 不裁。
+  if (
+    activeNCtx &&
+    activeNCtx > 0 &&
+    activeModelForBudget &&
+    activeModelForBudget.origin !== ModelOrigin.REMOTE
+  ) {
+    const trimBudget = activeNCtx - GENERATION_RESERVE;
+    const trimmed = trimMessagesToBudget(messages, trimBudget);
+    if (trimmed.dropped > 0) {
+      messages = trimmed.messages as typeof messages;
+      emit('chat', 'chat.context_trimmed', {
+        dropped: trimmed.dropped,
+        budget: trimBudget,
+        nCtx: activeNCtx,
+      });
+    }
   }
 
   // Reseed the read_url exfiltration allowlist for this run; the trust policy

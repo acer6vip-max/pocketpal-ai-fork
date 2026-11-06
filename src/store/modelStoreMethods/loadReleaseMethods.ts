@@ -67,6 +67,23 @@ const LOAD_ATTEMPT_KEY = 'modelLoadAttempt:v1';
 /** 大模型门槛：≥4GB 权重在低内存机型上需要加载前先归还 native 缓存页。 */
 const LARGE_MODEL_BYTES = 4e9;
 
+/**
+ * 大模型可用上下文下限（2026-11-06 真机取证）：工具 schema 注入后提示词
+ * 基线 TOOL_BASELINE_TOKENS≈4500，2048 连系统提示词都放不下，加载成功也会
+ * 首轮硬错「Context is full」（用户实测 9B 落在 2048 后会话永久失败）。
+ * 9B 权重已超 6GB 估算线时，档位再小也省不出可用性——宁可 4096 尽力加载，
+ * 真被厂商看护杀掉再由崩溃标记降 CPU，而不是静默退到聊不了的 2048。
+ */
+const MIN_USABLE_CONTEXT = 4096;
+
+/**
+ * 大模型批次上限：compute buffer = (n_vocab+n_embd)×n_ubatch×4，
+ * 9B 词表 15 万时 512 档约 0.32GB，压到 128 约 0.08GB——用这点 prefill
+ * 速度换回 4096 档 KV 的内存增量，逼近 2048 的真实 PSS。
+ */
+const LARGE_MODEL_N_BATCH = 256;
+const LARGE_MODEL_N_UBATCH = 128;
+
 /** 取上下文档位的下一档（如 4096 → 2048）；已是最小档返回 undefined。 */
 function nextLowerContextTier(nCtx: number): number | undefined {
   let lower: number | undefined;
@@ -95,8 +112,8 @@ function clampBatchToContext(
 
 /**
  * 按实时可用内存挑选最大可装档位：预算 = resolveLoadBudget（6GB PSS 硬杀线上限）。
- * 若连最小档位都装不下（大模型权重本身已超预算），仍返回最小档尽力加载，
- * 而不是干脆拒绝——原版 App 9B 正是以最小档位稳定运行。
+ * 若所有档位都装不下（大模型权重本身已超预算），返回该模型的可用下限
+ * （大模型 4096，小模型最小档）尽力加载，而不是静默退到聊不了的 2048。
  */
 function pickSafeContextTier(
   model: Model,
@@ -105,8 +122,14 @@ function pickSafeContextTier(
   requested: number,
   availableBytes: number | undefined,
 ): number {
+  // 大模型不允许退到「聊不了」的档位：2048 装不下系统提示词/工具基线。
+  const floor =
+    model.size >= LARGE_MODEL_BYTES ? MIN_USABLE_CONTEXT : CONTEXT_LADDER[0];
+  const effectiveRequested = Math.max(requested, floor);
   const budget = resolveLoadBudget(availableBytes);
-  const tiers = CONTEXT_LADDER.filter(tier => tier <= requested).reverse();
+  const tiers = CONTEXT_LADDER.filter(
+    tier => tier >= floor && tier <= effectiveRequested,
+  ).reverse();
   for (const tier of tiers) {
     try {
       const estimate = getModelMemoryRequirement(model, projectionModel, {
@@ -120,7 +143,7 @@ function pickSafeContextTier(
       // 元数据不可用时无法验算，跳过该档继续往下找
     }
   }
-  return CONTEXT_LADDER[0];
+  return floor;
 }
 
 /** 读取上次未完成的加载尝试（同模型才生效）。 */
@@ -446,18 +469,24 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
 
     // 冷启动防崩循环：上次加载同一模型时进程被厂商 PSS 看护直接杀掉，
     // 标记不会被清理。本次先降一档，避免「启动即被杀」的死循环。
+    const minUsable =
+      model.size >= LARGE_MODEL_BYTES ? MIN_USABLE_CONTEXT : CONTEXT_LADDER[0];
     const crashed = await readCrashedLoadAttempt(model.id);
     let forceCpuFallback = false;
     if (crashed) {
       const current = store.getModelNCtx(model.id);
       const lower = nextLowerContextTier(crashed.nCtx);
-      if (current >= crashed.nCtx && lower !== undefined) {
+      if (
+        current >= crashed.nCtx &&
+        lower !== undefined &&
+        lower >= minUsable
+      ) {
         console.warn(
           `[ModelStore] previous load of "${model.name}" at n_ctx ${crashed.nCtx} was killed; retry at ${lower}`,
         );
         store.setModelNCtx(model.id, lower, 'preset');
       } else if (crashed.nGpuLayers > 0) {
-        // 上下文已到最小档仍被杀：上次是 GPU 全量卸载，这次退 CPU
+        // 上下文已到可用下限仍被杀：上次是 GPU 全量卸载，这次退 CPU
         forceCpuFallback = true;
         console.warn(
           `[ModelStore] previous load of "${model.name}" at n_ctx ${crashed.nCtx} with ${crashed.nGpuLayers} GPU layers was killed; fallback to CPU`,
@@ -467,6 +496,22 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
 
     // 加载前按实时可用内存夹紧上下文：preset 档位自动降档；
     // user 手调 = 可见决策 = 主权，不在这里改动。
+    // 大模型顺带收紧 n_batch/n_ubatch：compute buffer 与 n_ubatch 成正比，
+    // 省下的内存正好补上 4096 档 KV 的增量（否则只能退回聊不了的 2048）。
+    const baseSettings: ContextInitParams =
+      model.size >= LARGE_MODEL_BYTES
+        ? {
+            ...store.contextInitParams,
+            n_batch: Math.min(
+              store.contextInitParams.n_batch ?? LARGE_MODEL_N_BATCH,
+              LARGE_MODEL_N_BATCH,
+            ),
+            n_ubatch: Math.min(
+              store.contextInitParams.n_ubatch ?? LARGE_MODEL_N_UBATCH,
+              LARGE_MODEL_N_UBATCH,
+            ),
+          }
+        : store.contextInitParams;
     let availableBytes: number | undefined;
     try {
       availableBytes = await NativeHardwareInfo.getAvailableMemory();
@@ -478,7 +523,7 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
       const safe = pickSafeContextTier(
         model,
         projectionModel,
-        store.contextInitParams,
+        baseSettings,
         requested,
         availableBytes,
       );
@@ -496,6 +541,18 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
       filePath,
       model.id,
     );
+
+    // 批次上限同步进实际 init 参数（pickSafeContextTier 只影响选档估值）
+    if (model.size >= LARGE_MODEL_BYTES) {
+      effectiveSettings = {
+        ...effectiveSettings,
+        n_batch: Math.min(effectiveSettings.n_batch ?? 512, LARGE_MODEL_N_BATCH),
+        n_ubatch: Math.min(
+          effectiveSettings.n_ubatch ?? 512,
+          LARGE_MODEL_N_UBATCH,
+        ),
+      };
+    }
 
     // 上次在最小上下文 + GPU 仍被系统杀掉：本次加载强制 CPU
     if (forceCpuFallback) {
@@ -571,17 +628,23 @@ export function applyLoadReleaseMethods(store: ModelStore): void {
           );
           const currentNCtx = effectiveSettings.n_ctx ?? CONTEXT_LADDER[0];
           const lower = nextLowerContextTier(currentNCtx);
-          if (lower !== undefined) {
+          // 还能在「可用下限」之上降档才降；大模型不再退到 2048（聊不了）。
+          if (lower !== undefined && lower >= minUsable) {
             effectiveSettings = clampBatchToContext(effectiveSettings, lower);
             continue;
           }
-          // 已到最小上下文仍失败：退 CPU-only（GPU/OpenCL 驱动缓冲也是内存大户）
+          // 已到可用下限仍失败：退 CPU-only（GPU/OpenCL 驱动缓冲也是内存大户）
           if ((effectiveSettings.n_gpu_layers ?? 0) > 0) {
             effectiveSettings = {
               ...effectiveSettings,
               n_gpu_layers: 0,
               devices: ['CPU'],
             };
+            continue;
+          }
+          // 最后手段：再降一档（大模型会到 2048），至少能加载
+          if (lower !== undefined) {
+            effectiveSettings = clampBatchToContext(effectiveSettings, lower);
             continue;
           }
         }

@@ -219,7 +219,7 @@ describe('策展默认 n_ctx 门禁（2026-08-21 真实 GGUF 验算；v2 2026-08
     expect(defaultNCtxForModel(genericLarge)).toBe(4096);
   });
 
-  it('版本号已随 v3 表升档（CURATED_TABLE_VERSION=3，驱动拉齐）', () => {
-    expect(CURATED_TABLE_VERSION).toBe(3);
+  it('版本号已随 v4 表升档（CURATED_TABLE_VERSION=4，驱动 2048→4096 自愈）', () => {
+    expect(CURATED_TABLE_VERSION).toBe(4);
   });
 });
