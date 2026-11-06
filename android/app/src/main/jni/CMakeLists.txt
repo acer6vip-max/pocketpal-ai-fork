@@ -101,6 +101,12 @@ add_subdirectory(../cpp/stable-diffusion.cpp sd-build)
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/hardware_info.cpp ../cpp/ImageGenJNI.cpp)
 
+# ImageGenJNI.cpp 用相对路径 #include "../jni/thirdparty/OpenCL-Headers/CL/cl.h" 找头，
+# 但 cl.h 内部是 <CL/cl_version.h>（angle bracket，走 include 目录），需给 appmodules 补一下。
+if (SD_OPENCL AND ANDROID)
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${_pp_opencl_inc}")
+endif()
+
 target_link_libraries(${CMAKE_PROJECT_NAME} stable-diffusion)
 
 find_library(log-lib log)
